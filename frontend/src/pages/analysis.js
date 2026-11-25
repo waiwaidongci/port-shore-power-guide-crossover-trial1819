@@ -28,7 +28,10 @@ export function chooseRun(runs, selected) {
 export async function results() {
   const {runs,run} = await currentRun();
   if (!run) return empty('提交一条分析任务后可在这里查看结果。','#2','配置分析');
-  const result = run.result ? report(run.result) : `<p ${run.error ? 'class="error"' : 'data-poll'}>${esc(run.error || states[run.state])}</p>`;
+  const progress = run.sampling && !run.result
+    ? `<p data-poll class="notice">随机化抽签段进度 ${run.sampling.completed}/${run.sampling.total}，收齐后出结论。</p>`
+    : '';
+  const result = run.result ? report(run.result) : `${progress}<p ${run.error ? 'class="error"' : 'data-poll'}>${esc(run.error || states[run.state])}</p>`;
   return `<section>${chooseRun(runs,run.id)}<p class="hint">数据版本 #${run.dataset_id} · 计算状态 ${states[run.state]}</p>${result}${run.result ? `<a class="button" href="#4/${run.id}">进入业务复核</a>` : '<a href="#2">回到分析条件</a>'}</section>`;
 }
 

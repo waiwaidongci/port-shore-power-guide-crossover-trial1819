@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from scripts.seed_demo import seed
+from migrations.schema import upgrade
 from src.config.settings import SEED
 from src.middlewares.http import install
 from src.models.database import cache, engine
@@ -16,6 +17,7 @@ from src.routes.api import router
 @asynccontextmanager
 async def lifespan(app):
     metadata.create_all(engine)
+    upgrade(engine)
     if SEED:
         try:
             logging.info('Demo seed: %s', seed())

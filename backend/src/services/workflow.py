@@ -1,11 +1,12 @@
 import time
 
 from fastapi import HTTPException
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, delete, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from src.constants.enums import State
 from src.models.database import add_event, engine, fetch_one
-from src.models.tables import datasets, deliveries, runs, schedules
+from src.models.tables import datasets, deliveries, runs, sampling_segments, schedules
 from src.services.data import parse_options
 
 
@@ -34,7 +35,7 @@ def claim_run():
         if claim.rowcount != 1:
             return None
         data = fetch_one(connection, datasets, run['dataset_id'])
-        return key, now, data['records'], run['options']
+        return {'id': key, 'claim': now, 'rows': data['records'], 'options': run['options']}
 
 
 def finish_run(key, claim, result, error):
@@ -46,6 +47,62 @@ def finish_run(key, claim, result, error):
                                                   error=error, finished=now))
         if saved.rowcount:
             add_event(connection, 'worker', state, key, now)
+
+
+def save_segment(key, fingerprint, index, hits, rng_state):
+    """Persist one drawn segment exactly once, tolerating out-of-order delivery.
+
+    Segments are identified by ``(run_id, fingerprint, segment)``; the unique
+    constraint makes a duplicate insert fail and be ignored, so each segment
+    counts exactly once no matter how many workers submit it or in what order.
+    Acceptance depends on the round, not the submitter's claim, so a worker
+    that was taken over mid-round can still contribute its segments. Segments
+    from a superseded round (different fingerprint) or a run that already
+    finished are rejected.
+    """
+    now = time.time()
+    with engine.begin() as connection:
+        run = fetch_one(connection, runs, key)
+        if run is None or run['state'] != State.running.value or run['sampling_fingerprint'] != fingerprint:
+            return False
+        try:
+            with connection.begin_nested():
+                connection.execute(insert(sampling_segments).values(
+                    run_id=key, fingerprint=fingerprint, segment=index, hits=hits,
+                    rng_state=rng_state, at=now))
+        except IntegrityError:
+            pass
+    return True
+
+
+def begin_sampling(key, claim, fingerprint, total):
+    """Open a new round, discarding any stored segments left from a prior round."""
+    with engine.begin() as connection:
+        run = fetch_one(connection, runs, key)
+        if run is None or run['state'] != State.running.value or run['started'] != claim:
+            return False
+        if run['sampling_fingerprint'] != fingerprint:
+            connection.execute(delete(sampling_segments).where(sampling_segments.c.run_id == key))
+            connection.execute(update(runs).where(runs.c.id == key).values(sampling_fingerprint=fingerprint,
+                               sampling_total=total))
+    return True
+
+
+def load_segment_hits(key, fingerprint):
+    with engine.connect() as connection:
+        rows = connection.execute(select(sampling_segments.c.segment, sampling_segments.c.hits)
+                                  .where(sampling_segments.c.run_id == key,
+                                         sampling_segments.c.fingerprint == fingerprint)).all()
+    return {segment: hits for segment, hits in rows}
+
+
+def load_segment_state(key, fingerprint, index):
+    """Return the stored RNG position *after* a segment, or ``None``."""
+    with engine.connect() as connection:
+        return connection.scalar(select(sampling_segments.c.rng_state)
+                                 .where(sampling_segments.c.run_id == key,
+                                        sampling_segments.c.fingerprint == fingerprint,
+                                        sampling_segments.c.segment == index))
 
 
 def review_run(key, body, actor):

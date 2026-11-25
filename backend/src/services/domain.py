@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ BLOCK_HOURS = SLOT_HOURS * SLOTS_PER_BLOCK
 ORDERS = ("AB", "BA")
 EXACT_LIMIT = 50_000
 MONTE_CARLO_DRAWS = 20_000
+SEGMENT_DRAWS = 500
 DEFAULT_SEED = 691124
 
 
@@ -30,6 +33,39 @@ class Plan:
 class Window:
     eligible: int
     on_time: int
+
+
+@dataclass(frozen=True)
+class SamplingPlan:
+    """Immutable description of one fixed-seed Monte Carlo round.
+
+    Draws are split into equal segments so a stopped worker can persist and
+    resume individual draws without changing the random stream. ``scores`` and
+    ``observed`` are the same integer-scaled values the whole-round algorithm
+    uses.
+    """
+
+    scores: tuple[tuple[int, ...], ...]
+    observed: int
+    seed: int
+    draws: int = MONTE_CARLO_DRAWS
+    chunk: int = SEGMENT_DRAWS
+
+    @property
+    def segments(self) -> int:
+        return (self.draws + self.chunk - 1) // self.chunk
+
+    def segment_draws(self, index: int) -> int:
+        return max(0, min(self.chunk, self.draws - index * self.chunk))
+
+    def fingerprint(self) -> str:
+        """Stable identity of this sampling round (data, strata and seed)."""
+        payload = hashlib.sha256()
+        payload.update(f"{self.seed}:{self.draws}:{self.chunk}:{self.observed}".encode())
+        for stratum in self.scores:
+            payload.update(b"|")
+            payload.update(",".join(str(value) for value in stratum).encode())
+        return payload.hexdigest()
 
 
 def sample_rows() -> list[dict]:
@@ -148,31 +184,116 @@ def _percent(value: Fraction, digits: int = 2) -> float:
     return round(float(value * 100), digits)
 
 
-def _randomization(
-    strata: list[list[tuple[str, Fraction]]], space: int, seed: int,
-) -> tuple[Fraction, int, int, str]:
-    """Compare selected AB sums on an exact integer scale, including ties."""
+def _integer_scores(
+    strata: list[list[tuple[str, Fraction]]],
+) -> tuple[list[list[int]], int]:
+    """Scale each stratum's gaps onto one exact integer axis and total AB."""
     scale = lcm(*(gap.denominator for stratum in strata for _, gap in stratum))
     scores = [[gap.numerator * (scale // gap.denominator) for _, gap in stratum] for stratum in strata]
     observed = sum(score for stratum, values in zip(strata, scores)
                    for (order, _), score in zip(stratum, values) if order == "AB")
-    if space <= EXACT_LIMIT:
-        possible = [
-            [sum(subset) for subset in combinations(values, len(values) // 2)]
-            for values in scores
-        ]
-        hits = sum(sum(totals) >= observed for totals in product(*possible))
-        return Fraction(hits, space), space, hits, "精确枚举"
+    return scores, observed
 
-    rng = Random(seed)
+
+def build_sampling_plan(strata: list[list[tuple[str, Fraction]]], seed: int) -> SamplingPlan:
+    scores, observed = _integer_scores(strata)
+    return SamplingPlan(tuple(tuple(values) for values in scores), observed, int(seed))
+
+
+def open_segment(plan: SamplingPlan, index: int) -> Random:
+    """Return an RNG advanced to the start of a segment by replaying from the seed.
+
+    Each draw consumes the MT19937 stream identically for a given set of stratum
+    sizes regardless of the sampled values, so replaying ``index * chunk`` draws
+    of the same sizes reproduces the exact state the whole-round loop holds at
+    that boundary. This is the fallback when no earlier segment's state is stored.
+    """
+    if not 0 <= index <= plan.segments:
+        raise ValueError("抽签段号超出本轮抽样范围，请核对段数。")
+    rng = Random(plan.seed)
+    sizes = [len(values) for values in plan.scores]
+    for _ in range(index * plan.chunk):
+        for size in sizes:
+            rng.sample([0] * size, size // 2)
+    return rng
+
+
+def dump_state(rng: Random) -> str:
+    """Serialize an RNG position so later segments can resume without replay."""
+    version, internal, gauss = rng.getstate()
+    return json.dumps([version, list(internal), gauss], separators=(",", ":"))
+
+
+def load_state(text: str) -> Random:
+    version, internal, gauss = json.loads(text)
+    rng = Random()
+    rng.setstate((version, tuple(internal), gauss))
+    return rng
+
+
+def draw_segment(plan: SamplingPlan, index: int, rng: Random) -> int:
+    """Draw one segment on ``rng``, advancing it to the next boundary; return hits."""
+    sizes = [len(values) for values in plan.scores]
     hits = 0
-    for _ in range(MONTE_CARLO_DRAWS):
-        selected = sum(sum(rng.sample(values, len(values) // 2)) for values in scores)
-        hits += selected >= observed
-    return Fraction(hits + 1, MONTE_CARLO_DRAWS + 1), MONTE_CARLO_DRAWS, hits, "蒙特卡洛抽样"
+    for _ in range(plan.segment_draws(index)):
+        selected = sum(sum(rng.sample(list(values), size // 2))
+                       for values, size in zip(plan.scores, sizes))
+        hits += selected >= plan.observed
+    return hits
 
 
-def compute(rows: list[dict], options: dict) -> dict:
+def sample_segment(plan: SamplingPlan, index: int) -> int:
+    """Recompute one segment in isolation (idempotent, used for verification)."""
+    if not 0 <= index < plan.segments:
+        raise ValueError("抽签段号超出本轮抽样范围，请核对段数。")
+    return draw_segment(plan, index, open_segment(plan, index))
+
+
+def combine_segments(plan: SamplingPlan, segments: dict[int, int]) -> tuple[Fraction, int, int, str]:
+    if set(segments) != set(range(plan.segments)):
+        raise ValueError("抽签段尚未收齐，不能合并随机化结果。")
+    hits = sum(segments[index] for index in range(plan.segments))
+    return (Fraction(hits + 1, plan.draws + 1), plan.draws, hits, "蒙特卡洛抽样")
+
+
+def whole_round_hits(plan: SamplingPlan) -> int:
+    """Single-pass draw used by the synchronous whole-round algorithm."""
+    rng = Random(plan.seed)
+    sizes = [len(values) for values in plan.scores]
+    hits = 0
+    for _ in range(plan.draws):
+        selected = sum(sum(rng.sample(list(values), size // 2))
+                       for values, size in zip(plan.scores, sizes))
+        hits += selected >= plan.observed
+    return hits
+
+
+@dataclass
+class Prepared:
+    """Assembly result before any randomization conclusion is drawn."""
+
+    details: list
+    metrics: dict
+    notes: list
+    points: list
+    low_coverage: list
+    included_orders: dict
+    gain_pp: Fraction | None
+    alpha: Fraction
+    minimum_gain: Fraction
+    exact: tuple | None = None
+    plan: SamplingPlan | None = None
+
+    @property
+    def both_orders(self) -> bool:
+        return all(self.included_orders.values())
+
+    @property
+    def can_publish(self) -> bool:
+        return not self.low_coverage and self.both_orders
+
+
+def prepare(rows: list[dict], options: dict) -> Prepared:
     if not rows:
         raise ValueError("未收到窗口台账，请导入至少一个包含 AB/BA 排班与工单统计的 CSV。")
     washout_raw = str(options.get("washout_hours", "2"))
@@ -291,7 +412,6 @@ def compute(rows: list[dict], options: dict) -> dict:
             low_coverage.append(zone)
 
     points = []
-    p_value = None
     gain_pp = None
     if included:
         means = {guide: sum(values, Fraction(0)) / included for guide, values in rates.items()}
@@ -303,9 +423,42 @@ def compute(rows: list[dict], options: dict) -> dict:
         })
         points = [{"label": order, "value": _percent(sum(values, Fraction(0)) / len(values))}
                   for order, values in order_gains.items() if values]
-    both_orders = all(included_orders.values())
-    if both_orders:
-        p_value, evaluated, hits, method = _randomization(strata, space, int(seed))
+
+    prepared = Prepared(details, metrics, notes, points, low_coverage, dict(included_orders),
+                        gain_pp, alpha, minimum_gain)
+    if not prepared.both_orders:
+        return prepared
+    if space <= EXACT_LIMIT:
+        prepared.exact = _exact_result(strata, space)
+    else:
+        prepared.plan = build_sampling_plan(strata, int(seed))
+    return prepared
+
+
+def _exact_result(strata: list[list[tuple[str, Fraction]]], space: int) -> tuple:
+    scores, observed = _integer_scores(strata)
+    possible = [
+        [sum(subset) for subset in combinations(values, len(values) // 2)]
+        for values in scores
+    ]
+    hits = sum(sum(totals) >= observed for totals in product(*possible))
+    return Fraction(hits, space), space, hits, "精确枚举"
+
+
+def finalize(prepared: Prepared, segments: dict[int, int] | None = None,
+             hits: int | None = None) -> dict:
+    metrics = dict(prepared.metrics)
+    notes = list(prepared.notes)
+    points = list(prepared.points)
+    p_value = None
+    if prepared.plan is not None:
+        if hits is None:
+            if segments is None:
+                raise ValueError("随机化抽签段尚未收齐，不能出结论。")
+            p_value, evaluated, hits, method = combine_segments(prepared.plan, segments)
+        else:
+            p_value = Fraction(hits + 1, prepared.plan.draws + 1)
+            evaluated, method = prepared.plan.draws, "蒙特卡洛抽样"
         metrics.update({
             "单侧随机化p值": float(p_value),
             "随机化方法": method,
@@ -313,30 +466,46 @@ def compute(rows: list[dict], options: dict) -> dict:
             "尾部命中数": hits,
         })
         if method == "蒙特卡洛抽样":
-            metrics["抽样种子"] = int(seed)
-            notes.append(f"固定种子 {seed} 独立等概率抽样 {evaluated} 次，p 值为（尾部命中数＋1）/（抽样次数＋1）。")
+            metrics["抽样种子"] = prepared.plan.seed
+            notes.append(f"固定种子 {prepared.plan.seed} 独立等概率抽样 {evaluated} 次，"
+                         f"p 值为（尾部命中数＋1）/（抽样次数＋1）。")
+    elif prepared.exact is not None:
+        p_value, evaluated, hits, method = prepared.exact
+        metrics.update({
+            "单侧随机化p值": float(p_value),
+            "随机化方法": method,
+            "实际评估分配数": evaluated,
+            "尾部命中数": hits,
+        })
 
-    can_publish = not low_coverage and both_orders
+    can_publish = prepared.can_publish
+    gain_pp = prepared.gain_pp
     if not can_publish:
         reasons = []
-        if low_coverage:
-            reasons.append(f"{'、'.join(low_coverage)}覆盖不足，请补齐窗口或扩展随机排班")
-        if not both_orders:
+        if prepared.low_coverage:
+            reasons.append(f"{'、'.join(prepared.low_coverage)}覆盖不足，请补齐窗口或扩展随机排班")
+        if not prepared.both_orders:
             reasons.append("纳入配对须同时覆盖 AB 和 BA，请补齐另一顺序的完整配对")
         headline = "暂缓发布。" + "。".join(reasons) + "。"
     elif gain_pp <= 0:
         headline = "保留 A。B 未带来正向的限时通电提升。"
-    elif gain_pp < minimum_gain:
+    elif gain_pp < prepared.minimum_gain:
         headline = "保留 A。B 的实测提升未达到试点收益门槛。"
-    elif p_value > alpha:
+    elif p_value > prepared.alpha:
         headline = "延长试验。提升达到业务门槛，随机化证据仍不足。"
     else:
         headline = f"建议分区上线 B。限时通电达标率提升 {float(gain_pp):.2f} 个百分点。"
     return {
         "headline": headline,
         "metrics": metrics,
-        "rows": details,
+        "rows": prepared.details,
         "notes": notes,
         "chart": {"label": "按分配顺序查看限时通电提升", "unit": "百分点", "points": points},
         "can_publish": can_publish,
     }
+
+
+def compute(rows: list[dict], options: dict) -> dict:
+    prepared = prepare(rows, options)
+    hits = whole_round_hits(prepared.plan) if prepared.plan is not None else None
+    return finalize(prepared, hits=hits)

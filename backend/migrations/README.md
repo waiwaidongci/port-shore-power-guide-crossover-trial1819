@@ -1,1 +1,1 @@
-初始结构由 `src/models/tables.py` 定义，在 API 启动前由 `metadata.create_all` 创建。演示数据通过独立入口填充。
+初始结构由 `src/models/tables.py` 定义，在 API 启动前由 `metadata.create_all` 创建。`create_all` 只建缺失的表，不会给已存在的表加列；`migrations/schema.py` 的 `upgrade` 在启动时补齐新增列（如 `analysis_runs.sampling_fingerprint`、`sampling_total`），可重复执行。演示数据通过独立入口填充。
